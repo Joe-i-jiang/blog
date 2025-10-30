@@ -122,3 +122,41 @@ linux2.6将每个内存节点的物理内存分为3个管理区。
 如果不支持NUMA，那么flags中管理区索引占两位，节点索引占1位（通常设为0）。  
 如果支持，且32位上，flags中管理区flags中管理区索引占两位，节点索引占六位。  
 支持且64位上，flags中管理区索引占两位，节点索引占十位。
+
+### 保留的页框池
+
+当请求内存时，为了保证某些内核不能备阻塞，例如原子内存分配，内核为原子内存分配请求保留了一个页框池，只有在内存不足时才使用。  
+保留内存数量，以KB为单位，存在`min_free_kbytes`变量中一般初始值，取决于，直接映射到内核线性地址空间的第四个GB物理内存的数量，即`ZONE_DMA`和`ZONE_NORMAL`的页框数量，贡献数量与之间大小成比例。
+
+<center>保留池大小 = $\left\lfloor \sqrt{16 \times \text{直接映射内存}} \right\rfloor$</center>
+
+### 分区页框分配器
+
+用于处理对连续页框组的内存分配请求。下图组成。  
+**_链接3_**  
+其中管理区分配器接受动态内存分配与释放的请求。分配内存时，页框被伙伴系统来处理。
+
+> 为了更好的性能，其中一小块儿页框保留在高速缓存中。
+
+#### 请求与释放页框
+
+6个函数或宏请求页框：
+
+1. `alloc_pages(gfp_mask, order)`：请求$2^\text{order}$个连续的页框。返回第一个分配的页框描述符的地址。
+2. `alloc_page(gfp_mask)`：相当于`alloc_page(gfp_mask, 0)`。
+3. `__get_free_pages(gfp_mask, order)`：同1，但返回第一个所分配页的线性地址。
+4. `__get_free_page(gfp_mask)`：相当于`__get_free_pages(gfp_mask, 0)`。
+5. `get_zeroed_page(gfp_mask)`：获取填满0的页框。相当于`alloc_pages(__GFP_ZERO | gfp_mask, 0)`。但返回的是页框的线性地址。
+6. `__get_dma_pages(gfp_mask, order)`：获得适用于DMA的页框。相当于`__get_free_pages(__GFP_DMA | gfp_mask, order)`
+
+其中请求页框的标志如下：  
+**_链接4_**
+
+4个释放页框的函数或宏：
+
+1. `__free_pages(page, order)`和`__free_page(page)`：输入为页框地址，检测描述符，`PG_reserved`为0时，就将count-1，变为0时。就会释放页框。
+2. `free_pages(addr, order)`和`free_page(addr)`：参数为线性地址。
+
+### 高端内存页框的内核映射
+
+该内存的起始点对应的线性地址在`high_memory`变量中，为896MB，但并不能直接映射到第4GB，
