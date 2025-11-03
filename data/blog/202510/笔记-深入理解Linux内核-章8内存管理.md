@@ -138,8 +138,9 @@ linux2.6将每个内存节点的物理内存分为3个管理区。
 
 > 为了更好的性能，其中一小块儿页框保留在高速缓存中。
 
+<div id="top">
 #### 请求与释放页框
-
+</div>
 6个函数或宏请求页框：
 
 1. `alloc_pages(gfp_mask, order)`：请求$2^\text{order}$个连续的页框。返回第一个分配的页框描述符的地址。
@@ -159,4 +160,181 @@ linux2.6将每个内存节点的物理内存分为3个管理区。
 
 ### 高端内存页框的内核映射
 
-该内存的起始点对应的线性地址在`high_memory`变量中，为896MB，但并不能直接映射到第4GB，
+该内存的起始点对应的线性地址在`high_memory`变量中，为896MB，但并不能直接映射到第4GB，所以不能用`__get_free_pages()`，也就是说，ZONE_HIGHMEM管理区是空的。  
+内核采用三种不同的机制将页框映射到高端内存，分别是：[永久内核映射](#top)、临时内核映射和非连续内存分配。对应三种不同的映射，128MB的空间，4MB分配于永久内核映射，4MB分配于临时内核映射，其余为非连续内存。
+
+#### 永久内核映射
+
+它们使用主内核页表中一个专门的页表，地址存在`pkmap_page_table`变量中。表项数由`LAST_PKMAP`宏产生，多少取决于PAE是否被激活。  
+页表的映射地址起始点为`PKMAP_BASE`。每个`pkmap_page_table`都有一个``pkmap_count`的计数器。当为0时，页表可用；当为1时，页表未被TLB刷新，不可用；当为n时，有n-1个正在使用该页框。
+
+为记录高端页框与永久内核映射包含的线性地址之间的联系，内核使用了`page_address_htable`散列表，该表包含一个page_address_map数据结构，用于为高端内存中的每个页框进行映射。
+
+```c
+// linux version : 6.17.2
+/*
+ * Describes one page->virtual association
+ */
+struct page_address_map {
+	struct page *page;
+	void *virtual;
+	struct list_head list;
+};
+
+static struct page_address_map page_address_maps[LAST_PKMAP];
+
+/*
+ * Hash table bucket
+ */
+static struct page_address_slot {
+	struct list_head lh;			/* List of page_address_maps */
+	spinlock_t lock;			/* Protect this bucket's list */
+} ____cacheline_aligned_in_smp page_address_htable[1<<PA_HASH_ORDER];
+
+static struct page_address_slot *page_slot(const struct page *page)
+{
+	return &page_address_htable[hash_ptr(page, PA_HASH_ORDER)];
+}
+```
+
+`page_address`通过页框返回线性地址。
+
+1. 如果存在高端内存，但未被映射，返回NULL。
+2. 如果不存在高端内存里（即：PG_Highmem=0），则线性地址总是存在，可以通过页框下标得到对应的物理地址，再将物理地址转换为线性地址。
+
+```c
+#define page_to_virt(page)	__va(((((page) - mem_map) << PAGE_SHIFT) + PAGE_OFFSET))
+```
+
+3. 如果存在高端内存里，则通过`page_address_htable`表获得。
+
+`kmap()`函数建立永久内核映射时。如果页框属于高端内存，则会调用`kmap_high()`函数。
+
+```c
+// linux version : 6.17.2
+/**
+ * kmap_high - map a highmem page into memory
+ * @page: &struct page to map
+ *
+ * Returns the page's virtual memory address.
+ *
+ * We cannot call this from interrupts, as it may block.
+ */
+void *kmap_high(struct page *page)
+{
+	unsigned long vaddr;
+
+	/*
+	 * For highmem pages, we can't trust "virtual" until
+	 * after we have the lock.
+	 */
+	lock_kmap();
+	vaddr = (unsigned long)page_address(page);
+	if (!vaddr)
+		vaddr = map_new_virtual(page);
+	pkmap_count[PKMAP_NR(vaddr)]++;
+	BUG_ON(pkmap_count[PKMAP_NR(vaddr)] < 2);
+	unlock_kmap();
+	return (void *) vaddr;
+}
+```
+
+通过上面的`page_address`获取线性地址，如果未被分派，则调用`map_new_virtual`，其主要分为2个模块。
+
+1. 第一个模块是查找有没有空闲位置，搜索过程是如果第一轮没搜到，就用`flush_all_zero_pkmaps`对TLB缓存表刷新，再搜索，有的话就分配给`page_address_htable`，没有就进入下一步。
+
+```c
+	count = get_pkmap_entries_count(color);
+	/* Find an empty entry */
+	for (;;) {
+		last_pkmap_nr = get_next_pkmap_nr(color);
+		if (no_more_pkmaps(last_pkmap_nr, color)) {
+			flush_all_zero_pkmaps();
+			count = get_pkmap_entries_count(color);
+		}
+		if (!pkmap_count[last_pkmap_nr])
+			break;	/* Found a usable entry */
+		if (--count)
+			continue;
+```
+
+2. 第二个模块是如果没空位就休眠，并转让CPU，被唤醒后先查询是否被其他进程分配，如果没有回到第一步。
+
+```c
+		/*
+		 * Sleep for somebody else to unmap their entries
+		 */
+		{
+			DECLARE_WAITQUEUE(wait, current);
+			wait_queue_head_t *pkmap_map_wait =
+				get_pkmap_wait_queue_head(color);
+
+			__set_current_state(TASK_UNINTERRUPTIBLE);
+			add_wait_queue(pkmap_map_wait, &wait);
+			unlock_kmap();
+			schedule();
+			remove_wait_queue(pkmap_map_wait, &wait);
+			lock_kmap();
+
+			/* Somebody else might have mapped it while we slept */
+			if (page_address(page))
+				return (unsigned long)page_address(page);
+
+			/* Re-start */
+			goto start;
+		}
+```
+
+相反，`kunmap()`函数解除永久内核映射时。如果页框属于高端内存，则会调用`kunmap_high()`函数。该函数会将count-1，如果此时count=1，则被认为无进程在使用，然后进行唤醒其他使用该页的进程。
+
+```c
+void kunmap_high(struct page *page)
+{
+	unsigned long vaddr;
+	unsigned long nr;
+	unsigned long flags;
+	int need_wakeup;
+	unsigned int color = get_pkmap_color(page);
+	wait_queue_head_t *pkmap_map_wait;
+
+	lock_kmap_any(flags);
+	vaddr = (unsigned long)page_address(page);
+	BUG_ON(!vaddr);
+	nr = PKMAP_NR(vaddr);
+
+	/*
+	 * A count must never go down to zero
+	 * without a TLB flush!
+	 */
+	need_wakeup = 0;
+	switch (--pkmap_count[nr]) {
+	case 0:
+		BUG();
+	case 1:
+		/*
+		 * Avoid an unnecessary wake_up() function call.
+		 * The common case is pkmap_count[] == 1, but
+		 * no waiters.
+		 * The tasks queued in the wait-queue are guarded
+		 * by both the lock in the wait-queue-head and by
+		 * the kmap_lock.  As the kmap_lock is held here,
+		 * no need for the wait-queue-head's lock.  Simply
+		 * test if the queue is empty.
+		 */
+		pkmap_map_wait = get_pkmap_wait_queue_head(color);
+		need_wakeup = waitqueue_active(pkmap_map_wait);
+	}
+	unlock_kmap_any(flags);
+
+	/* do wake-up, if needed, race-free outside of the spin lock */
+	if (need_wakeup)
+		wake_up(pkmap_map_wait);
+}
+EXPORT_SYMBOL(kunmap_high);
+```
+
+#### 临时内核映射
+
+[参考文档](https://www.kernel.org/doc/html/latest/translations/zh_CN/mm/highmem.html)
+
+#### eee
