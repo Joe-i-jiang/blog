@@ -415,3 +415,180 @@ struct page {
 ```
 
 ##### 分配块
+
+先看linux6.17.2版本的分配流程。
+`alloc_pages` -> `alloc_hooks(alloc_pages_noprof(__VA_ARGS__))` -> `alloc_pages_node_noprof` -> `__alloc_pages_node_noprof` -> `__alloc_pages_noprof` -> `__alloc_frozen_pages_noprof` -> `get_page_from_freelist` -> `rmqueue` -> `rmqueue_buddy` -> `__rmqueue_smallest`或`__rmqueue`。虽然究极长，但前面一堆废话，也暂时不必关系，所以主要从下面开始。
+
+1. `__alloc_frozen_pages_noprof`：实际分配的主要入口。
+
+```c
+/*
+ * This is the 'heart' of the zoned buddy allocator.
+ */
+struct page *__alloc_frozen_pages_noprof(gfp_t gfp, unsigned int order,
+		int preferred_nid, nodemask_t *nodemask)
+{
+	// ...
+	if (!prepare_alloc_pages(gfp, order, preferred_nid, nodemask, &ac,
+			&alloc_gfp, &alloc_flags))
+		return NULL;
+
+	/*
+	 * Forbid the first pass from falling back to types that fragment
+	 * memory until all local zones are considered.
+	 */
+	alloc_flags |= alloc_flags_nofragment(zonelist_zone(ac.preferred_zoneref), gfp);
+
+	/* First allocation attempt */
+	page = get_page_from_freelist(alloc_gfp, order, alloc_flags, &ac);
+	if (likely(page))
+		goto out;
+
+	alloc_gfp = gfp;
+	ac.spread_dirty_pages = false;
+
+	/*
+	 * Restore the original nodemask if it was potentially replaced with
+	 * &cpuset_current_mems_allowed to optimize the fast-path attempt.
+	 */
+	ac.nodemask = nodemask;
+
+	page = __alloc_pages_slowpath(alloc_gfp, order, &ac);
+	// ...
+}
+```
+
+2. `get_page_from_freelist`：会遍历`zonelist`，在每个`zone`中尝试分配。在`zone`中，分配是通过`rmqueue`函数完成的。
+
+```c
+static struct page *get_page_from_freelist(gfp_t gfp_mask, unsigned int order,
+                      int alloc_flags, const struct alloc_context *ac)
+{
+    struct zoneref *z;
+    struct zone *zone;
+    struct page *page = NULL;
+
+    // 遍历所有合适的内存区域
+    for_next_zone_zonelist_nodemask(zone, z, ac->highest_zoneidx,
+					ac->nodemask) {
+        // 检查水位线
+ 		if (zone_watermark_fast(zone, order, mark,
+					ac->highest_zoneidx, alloc_flags,
+					gfp_mask))
+		// ...
+
+        // 尝试从伙伴系统分配
+ 		page = rmqueue(zonelist_zone(ac->preferred_zoneref), zone, order,
+				gfp_mask, alloc_flags, ac->migratetype);
+		if (page) {
+			prep_new_page(page, order, gfp_mask, alloc_flags);
+
+			/*
+			 * If this is a high-order atomic allocation then check
+			 * if the pageblock should be reserved for the future
+			 */
+			if (unlikely(alloc_flags & ALLOC_HIGHATOMIC))
+				reserve_highatomic_pageblock(page, order, zone);
+
+			return page;
+		} else {
+			// ...
+		}
+	}
+	// ...
+
+    return NULL;
+}
+```
+
+3. `rmqueue`：会先在per-CPU进行分配，不行就伙伴系统。
+
+```c
+static inline
+struct page *rmqueue(struct zone *preferred_zone,
+			struct zone *zone, unsigned int order,
+			gfp_t gfp_flags, unsigned int alloc_flags,
+			int migratetype)
+{
+	struct page *page;
+
+	// 1. 首先尝试从 PCP 分配
+	if (likely(pcp_allowed_order(order))) {
+		page = rmqueue_pcplist(preferred_zone, zone, order,
+				       migratetype, alloc_flags);
+		if (likely(page))
+			goto out;  // PCP 分配成功，直接返回
+	}
+
+	// 2. PCP 分配失败，回退到伙伴系统
+	page = rmqueue_buddy(preferred_zone, zone, order, alloc_flags,
+							migratetype);
+
+	// ...
+	return page;
+}
+```
+
+4. `rmqueue_buddy`：首先是在指定迁移类型中分配`__rmqueue_smallest`，指定的分配不了，再去其他迁移类型中分配`__rmqueue`。
+
+```c
+static __always_inline
+struct page *rmqueue_buddy(struct zone *preferred_zone, struct zone *zone,
+			   unsigned int order, unsigned int alloc_flags,
+			   int migratetype)
+{
+	// ...
+	do {
+		if (alloc_flags & ALLOC_HIGHATOMIC)
+			page = __rmqueue_smallest(zone, order, MIGRATE_HIGHATOMIC);
+		if (!page) {
+			enum rmqueue_mode rmqm = RMQUEUE_NORMAL;
+
+			page = __rmqueue(zone, order, migratetype, alloc_flags, &rmqm);
+
+			/*
+			 * If the allocation fails, allow OOM handling and
+			 * order-0 (atomic) allocs access to HIGHATOMIC
+			 * reserves as failing now is worse than failing a
+			 * high-order atomic allocation in the future.
+			 */
+			if (!page && (alloc_flags & (ALLOC_OOM|ALLOC_NON_BLOCK)))
+				page = __rmqueue_smallest(zone, order, MIGRATE_HIGHATOMIC);
+
+			if (!page) {
+				spin_unlock_irqrestore(&zone->lock, flags);
+				return NULL;
+			}
+		}
+	} while (check_new_pages(page, order));
+	// ...
+}
+```
+
+5. `__rmqueue_smallest`：其他类型最后也是调这个，所以只关心这个功能。事实上，到这一步就真正是伙伴系统在分配内存了。
+
+```c
+static __always_inline
+struct page *__rmqueue_smallest(struct zone *zone, unsigned int order,
+						int migratetype)  // ← 迁移类型参数
+{
+	unsigned int current_order;
+	struct free_area *area;
+	struct page *page;
+
+	/* 在指定迁移类型的空闲链表中查找合适大小的页面 */
+	for (current_order = order; current_order < NR_PAGE_ORDERS; ++current_order) {
+		area = &(zone->free_area[current_order]);
+		page = get_page_from_free_area(area, migratetype);  // ← 关键：按迁移类型获取
+		if (!page)
+			continue;
+
+		page_del_and_expand(zone, page, order, current_order,
+				    migratetype);  // ← 迁移类型传递到拆分逻辑
+		return page;
+	}
+	return NULL;
+}
+```
+
+##### 释放块
