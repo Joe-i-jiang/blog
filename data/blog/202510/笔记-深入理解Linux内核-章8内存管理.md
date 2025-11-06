@@ -1,7 +1,7 @@
 ---
 title: 笔记-深入理解Linux内核-章8内存管理
 date: '2025-10-23'
-lastmod: '2025-10-23'
+lastmod: '2025-11-06'
 tags: ['深入理解Linux内核', 'Linux内核', '笔记', '内存']
 draft: false
 summary: '阅读深入理解linux内核，第八章，笔记。'
@@ -335,6 +335,83 @@ EXPORT_SYMBOL(kunmap_high);
 
 #### 临时内核映射
 
-[参考文档](https://www.kernel.org/doc/html/latest/translations/zh_CN/mm/highmem.html)
+> 目前64位已经支持所有内存映射，几乎不再使用临时内核映射，所以这里不再专门说高端内存的映射。
 
-#### eee
+临时映射主要有三种方法：
+
+1. `kmap_local_page()`：它能在任何上下文中调用（包括中断），但映射只能从获取它们的上下文中使用。同时在可行情况下，应当比其他所有的函数优先使用。
+2. `kmap_atomic()`：允许对单个页面进行非常短的时间映射，但被限制在发布它的CPU上。它可以被中断上下文使用，因为不睡眠。同时每次调用时都会创建一个不可抢占的段，并禁用缺页异常。但也会被别的抢占。
+3. `kmap()`：对抢占和迁移没限制，但开销大。不需要再映射必须用`kunmap()`释放。
+
+参考文档：[高内存处理](https://www.kernel.org/doc/html/latest/translations/zh_CN/mm/highmem.html)
+
+#### 伙伴系统
+
+伙伴系统是用于高效管理内存分配的系统，将外碎片分成了11组链表，分别表示1,2,4,8,16,32,64,128,256,512,1024个连续的页框。
+
+##### 数据结构
+
+1. 每个内存节点`struct pglist_data`包含多个内存区域`struct zone`，每个区域中都有伙伴系统的数据结构。
+2. 在`struct zone`中，伙伴系统的核心数据结构是`free_area`数组，数组的索引表示阶`order`，即块的大小为$2^\text{order}$个页框。
+
+```c
+/*
+* 内存区域（zone）中的伙伴系统结构
+**/
+struct zone {
+    // ...
+
+    /* 伙伴系统核心数据结构 */
+    struct free_area free_area[MAX_ORDER];
+
+    // 每CPU页面缓存
+    struct per_cpu_pageset __percpu *pageset;
+
+    // 内存水位线
+    unsigned long watermark[NR_WMARK];  // WMARK_MIN, WMARK_LOW, WMARK_HIGH
+
+    // 保护锁
+    spinlock_t lock;
+
+    // ...
+};
+
+/*
+* 空闲区域描述符（free_area）
+**/
+#define MAX_ORDER 11  // 通常为11，最大支持2^10=1024个连续页框
+
+struct free_area {
+    struct list_head free_list[MIGRATE_TYPES];  // 按迁移类型分类的空闲链表
+    unsigned long nr_free;                      // 该阶数的空闲块总数
+};
+
+// 迁移类型定义（防止内存碎片）
+enum migratetype {
+    MIGRATE_UNMOVABLE,      // 不可移动页（内核核心数据）
+    MIGRATE_MOVABLE,        // 可移动页（用户进程内存）
+    MIGRATE_RECLAIMABLE,    // 可回收页（文件缓存等）
+    MIGRATE_PCPTYPES,       // 每CPU页面类型
+    MIGRATE_HIGHATOMIC,     // 高阶原子分配
+    MIGRATE_CMA,            // 连续内存分配器
+    MIGRATE_ISOLATE,        // 不能从此链表分配
+    MIGRATE_TYPES           // 类型总数
+};
+
+/*
+* 页面描述符中的伙伴系统信息
+**/
+struct page {
+    // 伙伴系统相关字段
+    struct list_head lru;           // 用于链接到空闲链表
+    unsigned long private;          // 用于存储伙伴系统的阶数(order)
+
+    // 引用计数和标志位
+    atomic_t _refcount;
+    unsigned long flags;
+
+    // ...
+};
+```
+
+##### 分配块
