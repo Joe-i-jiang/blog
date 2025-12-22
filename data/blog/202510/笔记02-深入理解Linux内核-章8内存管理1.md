@@ -1,7 +1,7 @@
 ---
-title: 笔记02-深入理解Linux内核-章8内存管理
+title: 笔记02-深入理解Linux内核-章8内存管理1
 date: '2025-10-23'
-lastmod: '2025-11-06'
+lastmod: '2025-12-22'
 tags: ['深入理解Linux内核', 'Linux内核', '笔记', '内存']
 draft: false
 summary: '阅读深入理解linux内核，第八章，笔记。'
@@ -125,7 +125,7 @@ linux2.6将每个内存节点的物理内存分为3个管理区。
 
 ### 保留的页框池
 
-当请求内存时，为了保证某些内核不能备阻塞，例如原子内存分配，内核为原子内存分配请求保留了一个页框池，只有在内存不足时才使用。  
+当请求内存时，为了保证某些内核不能被阻塞，例如原子内存分配，内核为原子内存分配请求保留了一个页框池，只有在内存不足时才使用。  
 保留内存数量，以KB为单位，存在`min_free_kbytes`变量中一般初始值，取决于，直接映射到内核线性地址空间的第四个GB物理内存的数量，即`ZONE_DMA`和`ZONE_NORMAL`的页框数量，贡献数量与之间大小成比例。
 
 <center>保留池大小 = $\left\lfloor \sqrt{16 \times \text{直接映射内存}} \right\rfloor$</center>
@@ -501,7 +501,7 @@ static struct page *get_page_from_freelist(gfp_t gfp_mask, unsigned int order,
 }
 ```
 
-3. `rmqueue`：会先在per-CPU进行分配，不行就伙伴系统。
+<span id="rmqueue"></span> 3. `rmqueue`：会先在per-CPU进行分配，不行就伙伴系统。
 
 ```c
 static inline
@@ -565,7 +565,7 @@ struct page *rmqueue_buddy(struct zone *preferred_zone, struct zone *zone,
 }
 ```
 
-5. `__rmqueue_smallest`：其他类型最后也是调这个，所以只关心这个功能。事实上，到这一步就真正是伙伴系统在分配内存了。
+5. `__rmqueue_smallest`：其他类型最后也是调这个，所以只关心这个功能。事实上，到这一步就真正是伙伴系统在分配内存了，for循环中就是一阶一阶的找空闲位置。
 
 ```c
 static __always_inline
@@ -591,4 +591,253 @@ struct page *__rmqueue_smallest(struct zone *zone, unsigned int order,
 }
 ```
 
+6. `page_del_and_expand`和`expand`：这坨就是负责拆页的代码了。
+
 ##### 释放块
+
+略
+
+#### per CPU 页框高速缓存
+
+为提升性能，每个内存管理区定义了一个“PER_CPU”页框高速缓存，包括两个高速缓存：
+
+1. 热高速缓存：存放的页框内容刚被释放，很可能马上再次被分配。
+2. 冷高速缓存：相当于程序访问一块很久没有使用过的内存区域。
+   > 现阶段linux已将其废除👆
+
+该主要数据结构如下：
+
+```c
+// 2.6.11.1
+struct per_cpu_pages {
+	int count;		/* number of pages in the list */
+	int low;		/* low watermark, refill needed */
+	int high;		/* high watermark, emptying needed */
+	int batch;		/* chunk size for buddy add/remove */
+	struct list_head list;	/* the list of pages */
+};
+
+struct per_cpu_pageset {
+	struct per_cpu_pages pcp[2];	/* 0: hot.  1: cold */
+#ifdef CONFIG_NUMA
+	unsigned long numa_hit;		/* allocated in intended node */
+	unsigned long numa_miss;	/* allocated in non intended node */
+	unsigned long numa_foreign;	/* was intended here, hit elsewhere */
+	unsigned long interleave_hit; 	/* interleaver prefered this zone */
+	unsigned long local_node;	/* allocation from local node */
+	unsigned long other_node;	/* allocation from other node */
+#endif
+} ____cacheline_aligned_in_smp;
+
+
+// 6.17.2
+struct per_cpu_pages {
+	spinlock_t lock;	/* Protects lists field */
+	int count;		/* number of pages in the list */
+	int high;		/* high watermark, emptying needed */
+	int high_min;		/* min high watermark */
+	int high_max;		/* max high watermark */
+	int batch;		/* chunk size for buddy add/remove */
+	u8 flags;		/* protected by pcp->lock */
+	u8 alloc_factor;	/* batch scaling factor during allocate */
+#ifdef CONFIG_NUMA
+	u8 expire;		/* When 0, remote pagesets are drained */
+#endif
+	short free_count;	/* consecutive free count */
+
+	/* Lists of pages, one per migrate type stored on the pcp-lists */
+	struct list_head lists[NR_PCP_LISTS];
+} ____cacheline_aligned_in_smp;
+```
+
+> 在旧时，例如linux2.6版本，如上，该数据结构中，有high和low，分别表示高速换成的上界和下界，如果有分配的页框个数低于下界low，内核需要从伙伴系统中补充对于的高速缓存。而高于上界high，则释放batch个页框到伙伴系统，同时将冷热分开。  
+> 在现代linux版本中，变成如上述数据结构。不再考虑下界，同时也不单独分冷热，都在一个list。所以该缓存不再参与对冷热的分配，**下面分配和释放与原文无关**。
+
+内核为每个 CPU 维护一个页框高速缓存，其大小受一个动态上界 high 限制。当高速缓存中的页框不足以满足分配请求时，内核从伙伴系统中批量分配 batch 个页框进行补充；当缓存页框数超过 high 时，多余的页框将被批量释放回伙伴系统。在内存回收或压力场景下，per-CPU 高速缓存可以被主动清空。该机制避免了静态下界带来的内存浪费，使 per-CPU 缓存成为一种可回收的性能优化结构。(GPT)
+
+##### 分配页框
+
+上述伙伴系统[步骤3](#rmqueue)时，进行rmqueue，就是直接进入PCP入口rmqueue_pcplist（原linux2.6为buffered_rmqueue，后续不再关注）。
+
+1. 仅当order==0时，使用per-CPU页框高速缓存。
+2. 当count>0时，从list中取出一个页描述符。
+3. 当count=0时，尝试从伙伴系统中分配batch个页框插在pcp链表中，然后步骤2。
+
+```c
+/* Remove page from the per-cpu list, caller must protect the list */
+static inline
+struct page *__rmqueue_pcplist(struct zone *zone, unsigned int order,
+			int migratetype,
+			unsigned int alloc_flags,
+			struct per_cpu_pages *pcp,
+			struct list_head *list)
+{
+	struct page *page;
+
+	do {
+		if (list_empty(list)) {
+			int batch = nr_pcp_alloc(pcp, zone, order);
+			int alloced;
+
+			alloced = rmqueue_bulk(zone, order,
+					batch, list,
+					migratetype, alloc_flags);
+
+			pcp->count += alloced << order;
+			if (unlikely(list_empty(list)))
+				return NULL;
+		}
+
+		page = list_first_entry(list, struct page, pcp_list);
+		list_del(&page->pcp_list);
+		pcp->count -= 1 << order;
+	} while (check_new_pages(page, order));
+
+	return page;
+}
+```
+
+4. 当分配失败时，返回NULL。
+
+##### 释放页框
+
+顺序：`___free_pages` -> `__free_frozen_pages` -> `free_frozen_page_commit`
+
+1. 先判断是否符合pcp释放类型，同时，只能将order-0的页框释放到pcp链表中。
+
+```c
+/*
+ * Free a pcp page
+ */
+static void __free_frozen_pages(struct page *page, unsigned int order,
+				fpi_t fpi_flags)
+{
+	// ......
+	pcp_trylock_prepare(UP_flags);
+	pcp = pcp_spin_trylock(zone->per_cpu_pageset);
+	if (pcp) {
+		free_frozen_page_commit(zone, pcp, page, migratetype, order, fpi_flags);
+		pcp_spin_unlock(pcp);
+	} else {
+		free_one_page(zone, page, pfn, order, fpi_flags);
+	}
+	pcp_trylock_finish(UP_flags);
+}
+```
+
+2. 如果count>batch则释放
+
+```c
+static void free_frozen_page_commit(struct zone *zone,
+		struct per_cpu_pages *pcp, struct page *page, int migratetype,
+		unsigned int order, fpi_t fpi_flags)
+{
+	int high, batch;
+	int pindex;
+	bool free_high = false;
+
+	/*
+	 * On freeing, reduce the number of pages that are batch allocated.
+	 * See nr_pcp_alloc() where alloc_factor is increased for subsequent
+	 * allocations.
+	 */
+	pcp->alloc_factor >>= 1;
+	__count_vm_events(PGFREE, 1 << order);
+	pindex = order_to_pindex(migratetype, order);
+	list_add(&page->pcp_list, &pcp->lists[pindex]);
+	pcp->count += 1 << order;
+
+	batch = READ_ONCE(pcp->batch);
+	/*
+	 * As high-order pages other than THP's stored on PCP can contribute
+	 * to fragmentation, limit the number stored when PCP is heavily
+	 * freeing without allocation. The remainder after bulk freeing
+	 * stops will be drained from vmstat refresh context.
+	 */
+	if (order && order <= PAGE_ALLOC_COSTLY_ORDER) {
+		free_high = (pcp->free_count >= (batch + pcp->high_min / 2) &&
+			     (pcp->flags & PCPF_PREV_FREE_HIGH_ORDER) &&
+			     (!(pcp->flags & PCPF_FREE_HIGH_BATCH) ||
+			      pcp->count >= batch));
+		pcp->flags |= PCPF_PREV_FREE_HIGH_ORDER;
+	} else if (pcp->flags & PCPF_PREV_FREE_HIGH_ORDER) {
+		pcp->flags &= ~PCPF_PREV_FREE_HIGH_ORDER;
+	}
+	if (pcp->free_count < (batch << CONFIG_PCP_BATCH_SCALE_MAX))
+		pcp->free_count += (1 << order);
+
+	if (unlikely(fpi_flags & FPI_TRYLOCK)) {
+		/*
+		 * Do not attempt to take a zone lock. Let pcp->count get
+		 * over high mark temporarily.
+		 */
+		return;
+	}
+	high = nr_pcp_high(pcp, zone, batch, free_high);
+	if (pcp->count >= high) {
+		free_pcppages_bulk(zone, nr_pcp_free(pcp, batch, high, free_high),
+				   pcp, pindex);
+		if (test_bit(ZONE_BELOW_HIGH, &zone->flags) &&
+		    zone_watermark_ok(zone, 0, high_wmark_pages(zone),
+				      ZONE_MOVABLE, 0))
+			clear_bit(ZONE_BELOW_HIGH, &zone->flags);
+	}
+}
+```
+
+#### 管理分配器
+
+来自deepseek
+
+```c
+开始分配请求
+    ├─ 第一步：选择起点
+    │    根据GFP标志确定从哪个管理区开始
+    │
+    ├─ 第二步：检查水位
+    │    ├─ 水位充足(>low) → 尝试分配
+    │    ├─ 水位警戒(min~low) → 唤醒kswapd，然后尝试
+    │    └─ 水位危险(<min) → 直接回收，然后尝试
+    │
+    ├─ 第三步：分配尝试
+    │    ├─ 成功 → 返回内存 ✅
+    │    └─ 失败 → fallback到下一个管理区
+    │
+    ├─ 第四步：fallback循环
+    │    按优先级尝试所有允许的管理区
+    │
+    └─ 第五步：最终手段
+         如果所有管理区都失败：
+         1. 内存压缩
+         2. 直接回收
+         3. OOM Killer
+```
+
+##### 释放
+
+```c
+开始释放
+    ├─ 检查释放条件
+    │    引用计数减到0？页是否有效？
+    │
+    ├─ 单页释放(order=0)
+    │    ├─ 放入当前CPU的热缓存
+    │    ├─ 如果缓存超过高水位线
+    │    │     批量释放到伙伴系统
+    │    │         ↓
+    │    │     尝试伙伴合并
+    │    │     更新空闲链表
+    │    │
+    │    └─ 只更新Per-CPU计数，快速返回
+    │
+    └─ 多页释放(order>0)
+          ├─ 直接调用伙伴系统
+          ├─ 循环尝试伙伴合并
+          │    检查相邻块是否空闲且同类型
+          │    如果可以合并，形成更大块
+          │    继续尝试更高阶合并
+          │
+          ├─ 将最终块加入空闲链表
+          ├─ 更新管理区空闲页计数
+          └─ 可能唤醒等待内存的进程
+```
