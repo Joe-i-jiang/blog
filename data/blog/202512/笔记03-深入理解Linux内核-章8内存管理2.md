@@ -496,3 +496,9 @@ static void __slab_free(struct kmem_cache *s, struct slab *slab,
 ```
 
 ## 非连续管理区
+
+### 非连续内存区的线性地址
+
+**_链接5_**
+线性地址之间存在一个空区域，如图，8MB，这是用来捕获对内存的越界访问。4KB，这是一个安全区用来隔离非连续的内存区。  
+其中为非连续内存保留的线性地址空间的起始位置由VMALLOC_START->VMALLOC_END。
